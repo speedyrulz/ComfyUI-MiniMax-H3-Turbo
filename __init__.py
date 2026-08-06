@@ -104,25 +104,61 @@ def _egrid():
     return _EGRID
 
 
-def _unique_t(timestep, shift_v, shift_a, has_vis_cond):
-    sv = float((timestep.flatten()[0] / 1000.0).clamp(min=1e-6))
-    t_v = 1.0 - sv
-    t_a = 1.0 - _time_shift_sigma(sv, shift_v, shift_a)
+VISUAL_COND_T, AUDIO_COND_T = 0.999, 1.0
+
+
+def _cond_kinds(payload):
+    """Conditioning segment kinds present in the packed sequence.
+
+    The model decides its timestep rows from the packed layout's segments, not
+    from the raw keyframes/refs, and that layout rides in the payload — so read
+    it rather than re-deriving it. The keyframes/refs path mirrors PackedLayout
+    for the case where the layout wasn't prebuilt."""
+    layout = payload.get("layout")
+    segments = getattr(layout, "segments", None)
+    if segments is not None:
+        return {k for _, _, k in segments}
+    kinds = set()
+    if payload.get("keyframes"):
+        kinds.add("cond")
+    for blk in payload.get("refs") or []:
+        kind = blk.get("kind")
+        if kind in ("image", "video", "video_audio"):
+            kinds.add("ref_img")
+        if kind in ("audio", "video", "video_audio") and blk.get("ref_audio_t", 0) > 0:
+            kinds.add("ref_audio")
+    return kinds
+
+
+def _unique_t(timestep, shift_v, shift_a, payload):
+    """The model's distinct per-row timesteps, in its row order.
+
+    Must match comfy.ldm.minimax.model._forward exactly — these index the adaln
+    rows our delta is added to, so a single extra or missing row misaligns every
+    injection. Arithmetic stays on the fp32 tensor for the same reason: t_v is
+    compared against the cond timestep, and doing the subtract in float64
+    instead can split a value the model collapsed (or vice versa)."""
+    sv = (timestep.flatten()[0] / 1000.0).float().clamp(min=1e-6)
+    t_v = float(1.0 - sv)
+    t_a = float(1.0 - _time_shift_sigma(sv, shift_v, shift_a))
+    kinds = _cond_kinds(payload)
     s = {t_v, t_a}
-    if has_vis_cond:
-        s.add(max(t_v, 0.999))
+    if kinds & {"cond", "ref_img"}:
+        s.add(max(t_v, float(payload.get("visual_cond_noise_aug", VISUAL_COND_T))))
+    if "ref_audio" in kinds:
+        s.add(max(t_a, float(payload.get("audio_cond_noise_aug", AUDIO_COND_T))))
     return sorted(s)
 
 
 def _interp_egrid(unique_t, E, device, dtype):
-    E = E.to(device)
     n = E.shape[0]
     rows = []
     for t in unique_t:
         pos = min(max(t, 0.0), 1.0) * (n - 1)
         i0 = min(int(math.floor(pos)), n - 2)
         rows.append(torch.lerp(E[i0].float(), E[i0 + 1].float(), pos - i0))
-    return torch.stack(rows).to(dtype)                               # [M, 2688]
+    # interpolate on the cpu-resident grid, ship only the [M, 2688] result
+    return torch.stack(rows).to(device=device, dtype=dtype)
 
 
 class _AdalnDelta(torch.nn.Module):
@@ -141,6 +177,13 @@ class _AdalnDelta(torch.nn.Module):
         x = base.linear(F.silu(t_emb) if base.apply_silu else t_emb)
         st = self.shared.get("silu_temb")
         if st is not None:
+            if st.shape[0] != x.shape[0]:
+                # our row set disagrees with the model's; adding it would line the
+                # LoRA's video update up against an audio/cond row
+                raise RuntimeError(
+                    "MiniMaxH3TurboLoRA: expected {} timestep rows, model built "
+                    "{}. The LoRA's time-conditioning can't be aligned — please "
+                    "report the workflow.".format(st.shape[0], x.shape[0]))
             a, b = self.a.to(x.dtype), self.b.to(x.dtype)
             x = x + (b @ (a @ st.to(a.device, x.dtype).T)).T          # [M, out]
         x = x.view(x.shape[0] * base.modalities, base.expand * base.hidden)
@@ -240,9 +283,12 @@ class MiniMaxH3TurboLoRA:
             ts = args[1] if len(args) > 1 else kwargs.get("timestep")
             ctx = args[2] if len(args) > 2 else kwargs.get("context")
             payload = kwargs.get("minimax_payload") or {}
-            has_vc = bool(payload.get("keyframes") or payload.get("refs"))
-            us = _unique_t(ts, shift_v, shift_a, has_vc)
-            shared["silu_temb"] = _interp_egrid(us, E, ctx.device, ctx.dtype)
+            to = args[3] if len(args) > 3 else kwargs.get("transformer_options", {})
+            sv = float(to.get("minimax_h3_sigma_shift_video", shift_v))
+            sa = float(to.get("minimax_h3_sigma_shift_audio", shift_a))
+            us = _unique_t(ts, sv, sa, payload)
+            # curve-mode adaln runs in fp32, so keep the grid rows there too
+            shared["silu_temb"] = _interp_egrid(us, E, ctx.device, torch.float32)
             return executor(*args, **kwargs)
 
         new_model.add_wrapper_with_key(

@@ -147,6 +147,35 @@ class _AdalnDelta(torch.nn.Module):
         return x.chunk(base.expand, dim=-1)
 
 
+# --- lora key naming ------------------------------------------------------
+# The turbo LoRA ships with its keys already prefixed for ComfyUI
+# ("diffusion_model.blocks.0.attn..."), but other exports name the same modules
+# bare ("blocks.0.attn..."). Strip any prefix so we can rebuild the model-side
+# path ourselves instead of doubling it.
+
+_LORA_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "transformer.")
+
+
+def _dit_path(module):
+    for p in _LORA_PREFIXES:
+        if module.startswith(p):
+            return module[len(p):]
+    return module
+
+
+def _weight_patch(new_model, lora, to_load, strength, log_missing=True):
+    """add_patches drops keys the model doesn't have, so check what landed."""
+    applied = new_model.add_patches(
+        comfy.lora.load_lora(lora, to_load, log_missing=log_missing), strength)
+    if to_load and not applied:
+        k = next(iter(to_load))
+        raise RuntimeError(
+            "MiniMaxH3TurboLoRA: none of the LoRA's {} modules exist in the "
+            "loaded model (looked for '{}'). Is this a MiniMax-H3 LoRA, and is "
+            "the model a MiniMax-H3 base?".format(len(to_load), to_load[k]))
+    return applied
+
+
 class MiniMaxH3TurboSampler:
     @classmethod
     def INPUT_TYPES(cls):
@@ -180,21 +209,27 @@ class MiniMaxH3TurboLoRA:
     def apply_lora(self, model, lora_name, strength):
         path = folder_paths.get_full_path("loras", lora_name)
         lora = comfy.utils.load_torch_file(path, safe_load=True)
-        modules = sorted({k.rsplit(".lora_", 1)[0] for k in lora})
+        modules = sorted({k.rsplit(".lora_", 1)[0] for k in lora if ".lora_" in k})
         dm = model.model.diffusion_model
         pruned = getattr(dm, "use_adaln_curves", False)
         new_model = model.clone()
 
         if not pruned:
-            to_load = {m: "diffusion_model.{}.weight".format(m) for m in modules}
-            new_model.add_patches(comfy.lora.load_lora(lora, to_load), strength)
+            to_load = {m: "diffusion_model.{}.weight".format(_dit_path(m))
+                       for m in modules}
+            applied = _weight_patch(new_model, lora, to_load, strength)
+            print(f"[MiniMaxH3TurboLoRA] {len(applied)}/{len(to_load)} modules "
+                  f"patched", flush=True)
             return (new_model,)
 
         # pruned/curve base: backbone via weight patches, adaln via run-time delta
         backbone = [m for m in modules if "adaln_proj" not in m]
         adaln = [m for m in modules if "adaln_proj" in m]
-        to_load = {m: "diffusion_model.{}.weight".format(m) for m in backbone}
-        new_model.add_patches(comfy.lora.load_lora(lora, to_load), strength)
+        to_load = {m: "diffusion_model.{}.weight".format(_dit_path(m))
+                   for m in backbone}
+        # the adaln keys are handled below, so don't let load_lora cry about them
+        applied = _weight_patch(new_model, lora, to_load, strength,
+                                log_missing=False)
 
         E = _egrid()
         shared = {"silu_temb": None}
@@ -215,11 +250,17 @@ class MiniMaxH3TurboLoRA:
         for name in adaln:                       # name = "....adaln_proj.linear"
             a = lora[name + ".lora_A.weight"]
             b = lora[name + ".lora_B.weight"] * strength
-            key = "diffusion_model." + name.rsplit(".linear", 1)[0]
-            new_model.add_object_patch(key, _AdalnDelta(
-                new_model.get_model_object(key), a, b, shared))
-        print(f"[MiniMaxH3TurboLoRA] pruned base: {len(backbone)} backbone patched "
-              f"+ {len(adaln)} adaln injected at run time", flush=True)
+            key = "diffusion_model." + _dit_path(name).rsplit(".linear", 1)[0]
+            try:
+                base = new_model.get_model_object(key)
+            except AttributeError:
+                raise RuntimeError(
+                    "MiniMaxH3TurboLoRA: the model has no '{}' to inject the "
+                    "LoRA's adaln update into.".format(key)) from None
+            new_model.add_object_patch(key, _AdalnDelta(base, a, b, shared))
+        print(f"[MiniMaxH3TurboLoRA] pruned base: {len(applied)}/{len(backbone)} "
+              f"backbone patched + {len(adaln)} adaln injected at run time",
+              flush=True)
         return (new_model,)
 
 

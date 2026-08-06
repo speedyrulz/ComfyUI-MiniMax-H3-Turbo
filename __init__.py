@@ -25,6 +25,11 @@ import folder_paths
 
 SHIFT_V, SHIFT_A = 12.0, 3.0
 
+# MINIMAX_H3_TURBO_DEBUG=1 reports the size of the injected adaln update against
+# the projection it lands on, once per sampling step. A ratio well above 1 means
+# the injection is overpowering the model's time conditioning.
+_DEBUG = bool(os.environ.get("MINIMAX_H3_TURBO_DEBUG"))
+
 
 def _time_shift_sigma(sigma, fr, to):
     base = sigma / (fr + sigma * (1.0 - fr))
@@ -185,7 +190,14 @@ class _AdalnDelta(torch.nn.Module):
                     "{}. The LoRA's time-conditioning can't be aligned — please "
                     "report the workflow.".format(st.shape[0], x.shape[0]))
             a, b = self.a.to(x.dtype), self.b.to(x.dtype)
-            x = x + (b @ (a @ st.to(a.device, x.dtype).T)).T          # [M, out]
+            delta = (b @ (a @ st.to(a.device, x.dtype).T)).T          # [M, out]
+            if _DEBUG and self.shared.pop("debug_step", False):
+                xn, dn = float(x.detach().norm()), float(delta.detach().norm())
+                print("[MiniMaxH3TurboLoRA] t={} |adaln|={:.4f} |delta|={:.4f} "
+                      "ratio={:.4f}".format(
+                          [round(t, 4) for t in self.shared.get("t", ())],
+                          xn, dn, dn / max(xn, 1e-6)), flush=True)
+            x = x + delta
         x = x.view(x.shape[0] * base.modalities, base.expand * base.hidden)
         return x.chunk(base.expand, dim=-1)
 
@@ -289,6 +301,8 @@ class MiniMaxH3TurboLoRA:
             us = _unique_t(ts, sv, sa, payload)
             # curve-mode adaln runs in fp32, so keep the grid rows there too
             shared["silu_temb"] = _interp_egrid(us, E, ctx.device, torch.float32)
+            shared["t"] = us
+            shared["debug_step"] = _DEBUG      # first adaln of the step reports
             return executor(*args, **kwargs)
 
         new_model.add_wrapper_with_key(
@@ -303,6 +317,12 @@ class MiniMaxH3TurboLoRA:
                 raise RuntimeError(
                     "MiniMaxH3TurboLoRA: the model has no '{}' to inject the "
                     "LoRA's adaln update into.".format(key)) from None
+            if isinstance(base, _AdalnDelta) and key not in new_model.object_patches:
+                # not ours: a previous run's wrapper is still installed on the live
+                # model, so wrap the projection it wraps or the deltas compound.
+                # A wrapper we can see in object_patches is a deliberate chain and
+                # stacks, matching how the backbone patches accumulate.
+                base = base.base
             new_model.add_object_patch(key, _AdalnDelta(base, a, b, shared))
         print(f"[MiniMaxH3TurboLoRA] pruned base: {len(applied)}/{len(backbone)} "
               f"backbone patched + {len(adaln)} adaln injected at run time",

@@ -80,6 +80,14 @@ LoRA and use a stock sampler at 4 steps and the audio is broken, this is why.
   (124 ≈ 5 s). Validated range ~124–362 frames.
 - **VRAM**: MiniMax-H3 is large (~33 B); an 80 GB GPU is comfortable.
 
+## Credits
+
+The original node and the MiniMax-H3 Turbo LoRA are by
+[larryvrh](https://github.com/Larryvrh/ComfyUI-MiniMax-H3-Turbo); this repo
+continues it with additional fixes. The LoRA weights are unmodified and are
+still downloaded from the
+[upstream Hugging Face repo](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora).
+
 ## License
 
 Apache-2.0.

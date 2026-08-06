@@ -23,6 +23,11 @@ import comfy.utils
 import comfy.patcher_extension
 import folder_paths
 
+try:                                       # what the stock samplers step with, so
+    from comfy.utils import model_trange as _trange   # the console bar and the
+except ImportError:                        # dynamic-VRAM warmup readout match
+    from tqdm.auto import trange as _trange
+
 SHIFT_V, SHIFT_A = 12.0, 3.0
 
 # MINIMAX_H3_TURBO_DEBUG=1 reports the size of the injected adaln update against
@@ -74,7 +79,7 @@ def _turbo_sampler(model, x, sigmas, extra_args=None, callback=None, disable=Non
             "(the EmptyMiniMaxH3LatentAV / MiniMaxH3ImageToVideo output).")
     v_numel = math.prod(shapes[0][1:])           # flat pack is [video | audio]
     s_in = x.new_ones([x.shape[0]])
-    for i in range(len(sigmas) - 1):
+    for i in _trange(len(sigmas) - 1, disable=disable):
         sv, sv_n = float(sigmas[i]), float(sigmas[i + 1])
         denoised = model(x, sigmas[i] * s_in, **extra_args)
         out = (x - denoised) / sigmas[i]

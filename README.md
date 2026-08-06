@@ -27,7 +27,7 @@ image-to-video):
 **Or manually:**
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/larryvrh/ComfyUI-MiniMax-H3-Turbo
+git clone https://github.com/speedyrulz/ComfyUI-MiniMax-H3-Turbo
 ```
 Then restart ComfyUI.
 

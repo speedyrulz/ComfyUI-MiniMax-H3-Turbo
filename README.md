@@ -12,9 +12,11 @@ image-to-video):
 | **MiniMax-H3 Turbo LoRA** | `MODEL → MODEL`, applies the turbo LoRA |
 | **MiniMax-H3 Turbo Sampler (4-step)** | `→ SAMPLER`, feeds `SamplerCustomAdvanced` |
 
-> ⚠️ **Early preview.** The current LoRA is an early checkpoint — quality is
-> well short of a finished model, but already a clear step up from the base at
-> 4 steps. See the LoRA repo for details.
+> ⚠️ **Preview.** The current LoRA (`ckpt850`) is the final checkpoint of this
+> training round — sharp at 4 steps, but with known artifacts emerging
+> (plastic-looking skin, over-sharp grain); training is paused while we fix them.
+> See the [LoRA repo](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) for
+> details.
 
 ## Install
 
@@ -61,24 +63,48 @@ a pruned base automatically and re-injects the LoRA's time-conditioning at run
 time (a small `silu(t_emb)` grid ships with the node for this), so one LoRA file
 covers every base.
 
-## Why a custom sampler
+## Why a custom sampler (and how it adapts)
 
 MiniMax-H3 denoises the video and audio streams on two different flow schedules
-(video shift 12, audio shift 3). ComfyUI's stock samplers step both streams on
-one schedule, which is fine at ~20 steps but badly over-steps the audio at 4
-steps — the audio comes out distorted or blown out. This sampler steps each
-stream on its own schedule, so audio stays clean at 4 steps. If you load the
-LoRA and use a stock sampler at 4 steps and the audio is broken, this is why.
+(video shift 12, audio shift 3). **Recent ComfyUI handles this natively** — its
+`ModelSamplingAV` carries the audio latent on the video schedule — so a stock
+sampler already produces correct audio there. On **older ComfyUI without that
+support**, a stock sampler steps both streams on one schedule and badly over-steps
+the audio at 4 steps, so the audio comes out distorted or blown out.
+
+This node's sampler **auto-detects which ComfyUI it's running on**: on recent
+builds it steps as a plain single-schedule sampler (bit-for-bit the stock result);
+on older builds it steps each stream on its own clock so audio stays clean at 4
+steps. Keep it in the workflow and it does the right thing across ComfyUI versions
+— you don't need to change anything when you update ComfyUI. (On recent ComfyUI a
+stock `euler` sampler works too; the Turbo Sampler just keeps existing graphs
+working unchanged.)
 
 ## Notes
 
-- **Steps**: 4 works, but this early checkpoint is under-trained, so the
-  **comfort zone for sharpness is 6–8 steps**, not 4 (4 comes out softer). Any
-  count **≥ 4** is valid and **more steps look better**. Scheduler stays `simple`.
+- **Steps**: with `ckpt850`, **4 steps is already sharp** (earlier checkpoints
+  needed 6–8). Any count **≥ 4** is valid; more steps still help a little.
+  Scheduler stays `simple`.
+- **LoRA strength** (node input, default `1.0`) is the dial for the
+  sharpness/artifact trade-off: if the result shows **blurry ghosting / smear**,
+  nudge strength **up** (e.g. `1.05–1.2`); if it shows **over-sharp grain /
+  artifacts**, nudge it **down** (e.g. `0.8–0.95`).
 - **Resolution / length**: width and height are multiples of 32 (short edge
   typically 768); frame count is at 24 fps and snaps to the model's 17·k+5 grid
   (124 ≈ 5 s). Validated range ~124–362 frames.
-- **VRAM**: MiniMax-H3 is large (~33 B); an 80 GB GPU is comfortable.
+- **VRAM / `low_vram`**: MiniMax-H3 is large (~33 B). The LoRA node has a
+  **`low_vram`** switch that trades sharpness for peak VRAM:
+  - **off (default)** — applies the LoRA at run time (bypass): sharpest, and the
+    recommended path, but costs some extra peak VRAM.
+  - **on** — merges the LoRA into the weights: lowest peak VRAM, so smaller GPUs
+    can run and longer / higher-res clips fit, but the result is **softer on
+    quantized (`int8` / `fp8` / pruned) bases**, because the tiny update is
+    partly rounded away when it is folded back into the quantized weights.
+
+  If you hit an out-of-memory error, turn `low_vram` **on** (and/or lower the
+  resolution or frame count). The node streams the base model, so it also runs
+  on much smaller GPUs than the ~33 B size suggests — an 80 GB GPU is only
+  needed for the largest resolutions in `bypass` mode.
 
 ## Credits
 
